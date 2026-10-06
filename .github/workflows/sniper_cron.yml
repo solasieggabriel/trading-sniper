@@ -2,12 +2,11 @@ name: Dual-Key Sniper Session Runner
 
 on:
   schedule:
-    # 08:00 GMT+8 -> 00:00 UTC
-    # 16:00 GMT+8 -> 08:00 UTC
-    # 20:00 GMT+8 -> 12:00 UTC
-    # 00:00 GMT+8 -> 16:00 UTC
-    # Runs Monday through Friday
-    - cron: '0 0,8,12,16 * * 1-5'
+    # Separate cron entries with +2 minute offset to bypass GitHub top-of-the-hour queue drops
+    - cron: '2 0 * * 1-5'   # 08:02 GMT+8 (Asian Session Open)
+    - cron: '2 8 * * 1-5'   # 16:02 GMT+8 (London Session Open)
+    - cron: '2 12 * * 1-5'  # 20:02 GMT+8 (London / NY Overlap Prime)
+    - cron: '2 16 * * 1-5'  # 00:02 GMT+8 (Late US Session)
   workflow_dispatch: # Allows manual 1-click test run on GitHub anytime!
 
 jobs:
