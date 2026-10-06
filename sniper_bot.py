@@ -217,22 +217,58 @@ def run_sniper_engine():
     # Generate Chart
     generate_forecast_chart(master_df, idx_gmt8, curr_gold_close, lgbm_path, xgb_path, CHART_FILE)
 
-    # 2h Metrics for Gold
+    # 2h Metrics for Gold (Bar #8)
+    lgbm_up_2h   = lgbm_env[2]
     lgbm_down_2h = abs(lgbm_env[3])
-    lgbm_risk_2h = max(lgbm_env[2], 0.8)
-    lgbm_rr_2h   = lgbm_down_2h / lgbm_risk_2h
+    xgb_up_2h    = xgb_env[2]
+    xgb_down_2h  = abs(xgb_env[3])
 
-    xgb_down_2h = abs(xgb_env[3])
-    xgb_risk_2h = max(xgb_env[2], 0.8)
-    xgb_rr_2h   = xgb_down_2h / xgb_risk_2h
+    # Calculate both Bullish and Bearish R:R
+    lgbm_bull_rr = lgbm_up_2h / max(lgbm_down_2h, 0.8)
+    xgb_bull_rr  = xgb_up_2h  / max(xgb_down_2h, 0.8)
 
-    agree = (lgbm_rr_2h >= 2.5) and (xgb_rr_2h >= 2.5)
-    verdict = "STRICT AGREEMENT (Both Models Trigger)" if agree else "DIVERGENCE / CAUTION"
-    action = "SELL / SHORT" if agree else "STAND DOWN (Wait for Confluence)"
+    lgbm_bear_rr = lgbm_down_2h / max(lgbm_up_2h, 0.8)
+    xgb_bear_rr  = xgb_down_2h  / max(xgb_up_2h, 0.8)
 
-    hard_sl = curr_gold_close + max(lgbm_risk_2h, xgb_risk_2h) + 0.50
-    tp1 = curr_gold_close - abs((lgbm_env[1] + xgb_env[1]) / 2.0)
-    tp2 = curr_gold_close - min(lgbm_down_2h, xgb_down_2h)
+    # Bi-Directional Dual-Key Consensus (Accounting for Cross-Asset Causality)
+    if (lgbm_bear_rr >= 2.0) and (xgb_bear_rr >= 2.0) and (lgbm_down_2h > lgbm_up_2h) and (xgb_down_2h > xgb_up_2h):
+        direction = "BEARISH (SELL / SHORT)"
+        trigger_ref = "SILVER Breakdown -> Leads Gold Low (F=11.28)"
+        action = "SELL / SHORT GOLD"
+        instrument = "GOLD (GC=F)"
+        primary_lgbm_rr = f"{lgbm_bear_rr:.1f}:1"
+        primary_xgb_rr  = f"{xgb_bear_rr:.1f}:1"
+        verdict = "STRICT AGREEMENT (Both Models Trigger SHORT)"
+        hard_sl = curr_gold_close + max(lgbm_up_2h, xgb_up_2h) + 0.50
+        tp1 = curr_gold_close - abs((lgbm_env[1] + xgb_env[1]) / 2.0)
+        tp2 = curr_gold_close - min(lgbm_down_2h, xgb_down_2h)
+        risk_dist = hard_sl - curr_gold_close
+
+    elif (lgbm_bull_rr >= 2.0) and (xgb_bull_rr >= 2.0) and (lgbm_up_2h > lgbm_down_2h) and (xgb_up_2h > xgb_down_2h):
+        direction = "BULLISH (BUY / LONG)"
+        trigger_ref = "GOLD Breakout -> Leads Silver High (F=4.12, High Beta)"
+        action = "BUY / LONG SILVER (or Gold)"
+        instrument = "SILVER (SI=F) / GOLD (GC=F)"
+        primary_lgbm_rr = f"{lgbm_bull_rr:.1f}:1"
+        primary_xgb_rr  = f"{xgb_bull_rr:.1f}:1"
+        verdict = "STRICT AGREEMENT (Both Models Trigger LONG)"
+        hard_sl = curr_gold_close - max(lgbm_down_2h, xgb_down_2h) - 0.50
+        tp1 = curr_gold_close + abs((lgbm_env[0] + xgb_env[0]) / 2.0)
+        tp2 = curr_gold_close + min(lgbm_up_2h, xgb_up_2h)
+        risk_dist = curr_gold_close - hard_sl
+
+    else:
+        direction = "NEUTRAL / CHOP"
+        trigger_ref = "Cross-Asset Range Compression"
+        action = "STAND DOWN (Wait for Confluence)"
+        instrument = "NONE (Capital Protected)"
+        primary_lgbm_rr = f"Bull {lgbm_bull_rr:.1f}:1 | Bear {lgbm_bear_rr:.1f}:1"
+        primary_xgb_rr  = f"Bull {xgb_bull_rr:.1f}:1 | Bear {xgb_bear_rr:.1f}:1"
+        verdict = "DIVERGENCE / CONGESTION (No Trade)"
+        hard_sl = curr_gold_close
+        tp1 = curr_gold_close
+        tp2 = curr_gold_close
+        risk_dist = 0.0
 
     # Compute 8 Extreme Points (4-Hour Window)
     l_h = [curr_gold_close + lgbm_path[i] for i in range(16)]
@@ -257,16 +293,18 @@ def run_sniper_engine():
     message = (
         f"🎯 <b>[DUAL-KEY SNIPER SESSION REPORT]</b>\n"
         f"⏰ <b>Session Time:</b> {curr_time_gmt8}\n\n"
-        f"📌 <b>Trading Instrument:</b> GOLD (<code>GC=F</code>)\n"
+        f"📌 <b>Suggested Asset:</b> <code>{instrument}</code>\n"
+        f"🔗 <b>Causality Driver:</b> {trigger_ref}\n"
         f"💵 <b>Current Gold Price:</b> <code>${curr_gold_close:.2f}</code>\n"
         f"💵 <b>Current Silver Price:</b> <code>${curr_silver_close:.3f}</code>\n\n"
         f"📊 <b>2-Hour Forecast (Bar #8):</b>\n"
-        f"• <b>LightGBM:</b> Down -${lgbm_down_2h:.2f} | Risk +${lgbm_risk_2h:.2f} | <b>{lgbm_rr_2h:.1f}:1 R:R</b>\n"
-        f"• <b>XGBoost:</b> Down -${xgb_down_2h:.2f} | Risk +${xgb_risk_2h:.2f} | <b>{xgb_rr_2h:.1f}:1 R:R</b>\n"
+        f"• <b>Direction Bias:</b> <b>{direction}</b>\n"
+        f"• <b>LightGBM:</b> Upside +${lgbm_up_2h:.2f} | Down -${lgbm_down_2h:.2f} (R:R: <b>{primary_lgbm_rr}</b>)\n"
+        f"• <b>XGBoost:</b>  Upside +${xgb_up_2h:.2f} | Down -${xgb_down_2h:.2f} (R:R: <b>{primary_xgb_rr}</b>)\n"
         f"🚦 <b>Consensus:</b> <b>{verdict}</b>\n"
         f"──────────────────────────────\n"
-        f"🛒 <b>Suggested Action:</b> <b>{action}</b>\n"
-        f"🔴 <b>Hard Stop Loss:</b> <code>${hard_sl:.2f}</code> (Risk: ${hard_sl - curr_gold_close:.2f})\n"
+        f"🛒 <b>Action:</b> <b>{action}</b>\n"
+        f"🔴 <b>Hard Stop Loss:</b> <code>${hard_sl:.2f}</code> (Risk: ${risk_dist:.2f})\n"
         f"🟢 <b>Take Profit 1 (1h):</b> <code>${tp1:.2f}</code>\n"
         f"🟢 <b>Take Profit 2 (2h):</b> <code>${tp2:.2f}</code>\n"
         f"⏱️ <b>Time-Stop:</b> Bar #8 (+120 min)\n"
