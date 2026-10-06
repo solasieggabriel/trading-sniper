@@ -5,6 +5,8 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import pyarrow as pa
+import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from lightgbm import LGBMRegressor
@@ -27,6 +29,27 @@ TICKER_SILVER = "SI=F"
 # ==========================================
 # 2. DATA LAKE & MARKET INGESTION
 # ==========================================
+def save_parquet_safe(df, filepath):
+    """Saves dataframe to parquet cleanly using native Arrow table."""
+    reset_df = df.reset_index()
+    first_col = reset_df.columns[0]
+    reset_df.rename(columns={first_col: 'Timestamp'}, inplace=True)
+    reset_df['Timestamp'] = pd.to_datetime(reset_df['Timestamp'], utc=True).dt.strftime('%Y-%m-%d %H:%M:%S%z')
+    for col in reset_df.columns:
+        if col != 'Timestamp':
+            reset_df[col] = reset_df[col].astype('float64')
+    arrow_arrays = [pa.array(reset_df[col]) for col in reset_df.columns]
+    table = pa.Table.from_arrays(arrow_arrays, names=list(reset_df.columns))
+    pq.write_table(table, filepath)
+
+def load_parquet_safe(filepath):
+    """Loads parquet into pandas with UTC DatetimeIndex."""
+    table = pq.read_table(filepath)
+    df = table.to_pandas()
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], utc=True)
+    df = df.set_index('Timestamp').sort_index()
+    return df
+
 def fetch_clean_ticker(ticker, period="60d", interval="15m", prefix=""):
     print(f"--> Fetching {ticker} ({period}, {interval})...")
     raw_df = yf.download(ticker, period=period, interval=interval, progress=False)
@@ -39,11 +62,34 @@ def fetch_clean_ticker(ticker, period="60d", interval="15m", prefix=""):
     return clean_df
 
 def get_market_data():
-    """Fetches and aligns 15m historical data for Gold & Silver."""
-    gold_df = fetch_clean_ticker(TICKER_GOLD, period="60d", interval="15m", prefix="Gold_")
-    silver_df = fetch_clean_ticker(TICKER_SILVER, period="60d", interval="15m", prefix="Silver_")
-    merged = pd.merge(gold_df, silver_df, left_index=True, right_index=True, how='inner').sort_index()
-    return merged
+    """Fetches, updates, and persists 15m historical data for Gold & Silver."""
+    if PARQUET_FILE.exists():
+        print(f"--> Found existing data lake at: {PARQUET_FILE}")
+        existing_df = load_parquet_safe(PARQUET_FILE)
+        new_gold = fetch_clean_ticker(TICKER_GOLD, period="5d", interval="15m", prefix="Gold_")
+        new_silver = fetch_clean_ticker(TICKER_SILVER, period="5d", interval="15m", prefix="Silver_")
+        new_merged = pd.merge(new_gold, new_silver, left_index=True, right_index=True, how='inner')
+        if new_merged.index.tz is None:
+            new_merged.index = new_merged.index.tz_localize('UTC')
+        else:
+            new_merged.index = new_merged.index.tz_convert('UTC')
+        combined = pd.concat([existing_df, new_merged])
+        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+        save_parquet_safe(combined, PARQUET_FILE)
+        print(f"--> Data lake updated! Total rows: {len(combined)}")
+        return combined
+    else:
+        print("--> Initializing data lake from 60d download...")
+        gold_df = fetch_clean_ticker(TICKER_GOLD, period="60d", interval="15m", prefix="Gold_")
+        silver_df = fetch_clean_ticker(TICKER_SILVER, period="60d", interval="15m", prefix="Silver_")
+        merged = pd.merge(gold_df, silver_df, left_index=True, right_index=True, how='inner').sort_index()
+        if merged.index.tz is None:
+            merged.index = merged.index.tz_localize('UTC')
+        else:
+            merged.index = merged.index.tz_convert('UTC')
+        save_parquet_safe(merged, PARQUET_FILE)
+        print(f"--> Data lake created! Total rows: {len(merged)}")
+        return merged
 
 # ==========================================
 # 3. FEATURE & TARGET FACTORY
