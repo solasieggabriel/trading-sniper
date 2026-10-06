@@ -2,9 +2,13 @@ name: Dual-Key Sniper Session Runner
 
 on:
   schedule:
-    # 08:00, 16:00, 20:00, 00:00 GMT+8 (Mon-Fri)
+    # 08:00 GMT+8 -> 00:00 UTC
+    # 16:00 GMT+8 -> 08:00 UTC
+    # 20:00 GMT+8 -> 12:00 UTC
+    # 00:00 GMT+8 -> 16:00 UTC
+    # Runs Monday through Friday
     - cron: '0 0,8,12,16 * * 1-5'
-  workflow_dispatch: # Allows manual 1-click test run anytime
+  workflow_dispatch: # Allows manual 1-click test run on GitHub anytime!
 
 jobs:
   run-sniper:

@@ -280,7 +280,8 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
     total_bars = hist_len + 16
     ax.set_xlim(-0.8, total_bars + 0.5)
     hist_ticks = [0, 4, 8, 12, 15]
-    hist_labels = [idx_gmt8[idx].strftime('%H:%M') for idx in hist_ticks]
+    hist_gmt8_tail = idx_gmt8[-hist_len:]
+    hist_labels = [hist_gmt8_tail[idx].strftime('%H:%M') for idx in hist_ticks]
     future_ticks = list(range(hist_len, total_bars))
     future_labels = [f"+{(s + 1) * 15}m" for s in range(16)]
 
