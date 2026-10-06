@@ -234,6 +234,25 @@ def run_sniper_engine():
     tp1 = curr_gold_close - abs((lgbm_env[1] + xgb_env[1]) / 2.0)
     tp2 = curr_gold_close - min(lgbm_down_2h, xgb_down_2h)
 
+    # Compute 8 Extreme Points (4-Hour Window)
+    l_h = [curr_gold_close + lgbm_path[i] for i in range(16)]
+    l_l = [curr_gold_close + lgbm_path[16 + i] for i in range(16)]
+    l_c = [curr_gold_close + lgbm_path[32 + i] for i in range(16)]
+
+    x_h = [curr_gold_close + xgb_path[i] for i in range(16)]
+    x_l = [curr_gold_close + xgb_path[16 + i] for i in range(16)]
+    x_c = [curr_gold_close + xgb_path[32 + i] for i in range(16)]
+
+    l_max_h = (int(np.argmax(l_h)) + 1) * 15, max(l_h)
+    l_min_l = (int(np.argmin(l_l)) + 1) * 15, min(l_l)
+    l_max_c = (int(np.argmax(l_c)) + 1) * 15, max(l_c)
+    l_min_c = (int(np.argmin(l_c)) + 1) * 15, min(l_c)
+
+    x_max_h = (int(np.argmax(x_h)) + 1) * 15, max(x_h)
+    x_min_l = (int(np.argmin(x_l)) + 1) * 15, min(x_l)
+    x_max_c = (int(np.argmax(x_c)) + 1) * 15, max(x_c)
+    x_min_c = (int(np.argmin(x_c)) + 1) * 15, min(x_c)
+
     # Build Telegram Message
     message = (
         f"🎯 <b>[DUAL-KEY SNIPER SESSION REPORT]</b>\n"
@@ -252,7 +271,19 @@ def run_sniper_engine():
         f"🟢 <b>Take Profit 2 (2h):</b> <code>${tp2:.2f}</code>\n"
         f"⏱️ <b>Time-Stop:</b> Bar #8 (+120 min)\n"
         f"──────────────────────────────\n"
-        f"<i>Check the attached chart for full 16-candle trajectory and all 8 extreme boundaries.</i>"
+        f"📍 <b>8 Forecast Extremes (Next 4 Hours):</b>\n"
+        f"🔵 <b>LightGBM:</b>\n"
+        f"  • Max High: <code>${l_max_h[1]:.2f}</code> (+{l_max_h[0]}m)\n"
+        f"  • Min Low: <code>${l_min_l[1]:.2f}</code> (+{l_min_l[0]}m)\n"
+        f"  • Peak Close: <code>${l_max_c[1]:.2f}</code> (+{l_max_c[0]}m)\n"
+        f"  • Floor Close: <code>${l_min_c[1]:.2f}</code> (+{l_min_c[0]}m)\n"
+        f"🟠 <b>XGBoost:</b>\n"
+        f"  • Max High: <code>${x_max_h[1]:.2f}</code> (+{x_max_h[0]}m)\n"
+        f"  • Min Low: <code>${x_min_l[1]:.2f}</code> (+{x_min_l[0]}m)\n"
+        f"  • Peak Close: <code>${x_max_c[1]:.2f}</code> (+{x_max_c[0]}m)\n"
+        f"  • Floor Close: <code>${x_min_c[1]:.2f}</code> (+{x_min_c[0]}m)\n"
+        f"──────────────────────────────\n"
+        f"<i>Check the attached chart for full 16-candle trajectory and envelopes.</i>"
     )
 
     send_telegram_notification(message, CHART_FILE)
