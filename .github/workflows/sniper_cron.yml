@@ -1,12 +1,11 @@
 name: Dual-Key Sniper Session Runner
 
 on:
-  # Automated schedule paused / disabled for maintenance & architecture overhaul
-  # schedule:
-  #   - cron: '2 0 * * 1-5'   # 08:02 GMT+8 (Asian Session Open)
-  #   - cron: '2 8 * * 1-5'   # 16:02 GMT+8 (London Session Open)
-  #   - cron: '2 12 * * 1-5'  # 20:02 GMT+8 (London / NY Overlap Prime)
-  #   - cron: '2 16 * * 1-5'  # 00:02 GMT+8 (Late US Session)
+  schedule:
+    # Multi-Scale POI Sniper Sessions (1 hour post-open + 2 min buffer)
+    - cron: '2 1 * * 1-5'   # 09:02 GMT+8 (Asian Session Post-Open: Initial Balance Sweep)
+    - cron: '2 9 * * 1-5'   # 17:02 GMT+8 (London Session Post-Open: Judas Swing Resolution)
+    - cron: '2 13 * * 1-5'  # 21:02 GMT+8 (New York Session Post-Open: US Cash Expansion)
   workflow_dispatch: # Allows manual 1-click test run on GitHub anytime if needed
 
 jobs:

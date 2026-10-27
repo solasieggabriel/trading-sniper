@@ -1,6 +1,12 @@
 import os
 import sys
 from pathlib import Path
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 import requests
 import numpy as np
 import pandas as pd
@@ -92,12 +98,103 @@ def get_market_data():
         return merged
 
 # ==========================================
-# 3. FEATURE & TARGET FACTORY
+# 3. MULTI-SCALE POI FEATURE FACTORY
 # ==========================================
 def build_features_and_targets(df_raw, max_lags=16, max_horizon=16):
     df = df_raw.copy().sort_index()
 
-    # Base Stationary Transforms (d=1)
+    # Time Encodings in GMT+8
+    if isinstance(df.index, pd.DatetimeIndex):
+        dt_gmt8 = df.index.tz_convert('Asia/Singapore') if df.index.tz is not None else df.index.tz_localize('UTC').tz_convert('Asia/Singapore')
+    else:
+        dt_gmt8 = pd.to_datetime(df.index, utc=True).tz_convert('Asia/Singapore')
+
+    df['Date_GMT8'] = dt_gmt8.date
+    df['Hour_GMT8'] = dt_gmt8.hour
+    minute_of_day = dt_gmt8.hour * 60 + dt_gmt8.minute
+    df['Sin_Time'] = np.sin(2 * np.pi * minute_of_day / 1440)
+    df['Cos_Time'] = np.cos(2 * np.pi * minute_of_day / 1440)
+    df['DayOfWeek'] = dt_gmt8.dayofweek
+
+    # -------------------------------------------------------------
+    # TIER 1: MACRO & WEEKLY CONTEXT (Up to 480 bars = 5 Days / 120h)
+    # -------------------------------------------------------------
+    # 5-Day Rolling Extremes & Weekly Range Exhaustion
+    df['Gold_5d_High'] = df['Gold_High'].rolling(480, min_periods=96).max()
+    df['Gold_5d_Low']  = df['Gold_Low'].rolling(480, min_periods=96).min()
+    df['Gold_Dist_5d_High'] = (df['Gold_Close'] - df['Gold_5d_High']) / (df['Gold_Close'] + 1e-6)
+    df['Gold_Dist_5d_Low']  = (df['Gold_Close'] - df['Gold_5d_Low']) / (df['Gold_Close'] + 1e-6)
+    df['Gold_Weekly_Range_Pct'] = (df['Gold_Close'] - df['Gold_5d_Low']) / (df['Gold_5d_High'] - df['Gold_5d_Low'] + 1e-6)
+
+    # Multi-Day Trend Regimes (50 EMA = 12.5h, 200 EMA = 50h)
+    df['Gold_EMA_50']  = df['Gold_Close'].ewm(span=50, adjust=False).mean()
+    df['Gold_EMA_200'] = df['Gold_Close'].ewm(span=200, adjust=False).mean()
+    df['Gold_EMA_Slope']   = (df['Gold_EMA_50'] - df['Gold_EMA_200']) / (df['Gold_Close'] + 1e-6)
+    df['Gold_Dist_EMA200'] = (df['Gold_Close'] - df['Gold_EMA_200']) / (df['Gold_Close'] + 1e-6)
+
+    # Silver Macro
+    df['Silver_5d_High'] = df['Silver_High'].rolling(480, min_periods=96).max()
+    df['Silver_5d_Low']  = df['Silver_Low'].rolling(480, min_periods=96).min()
+    df['Silver_Dist_5d_High'] = (df['Silver_Close'] - df['Silver_5d_High']) / (df['Silver_Close'] + 1e-6)
+    df['Silver_Dist_5d_Low']  = (df['Silver_Close'] - df['Silver_5d_Low']) / (df['Silver_Close'] + 1e-6)
+    df['Silver_Weekly_Range_Pct'] = (df['Silver_Close'] - df['Silver_5d_Low']) / (df['Silver_5d_High'] - df['Silver_5d_Low'] + 1e-6)
+    df['Silver_EMA_50']  = df['Silver_Close'].ewm(span=50, adjust=False).mean()
+    df['Silver_EMA_200'] = df['Silver_Close'].ewm(span=200, adjust=False).mean()
+    df['Silver_EMA_Slope'] = (df['Silver_EMA_50'] - df['Silver_EMA_200']) / (df['Silver_Close'] + 1e-6)
+
+    # -------------------------------------------------------------
+    # TIER 2: SESSION & DAILY POIs (96 bars = 24 Hours)
+    # -------------------------------------------------------------
+    # Daily Calendar Anchors (PDH, PDL, PDC, Daily Open)
+    daily_stats = df.groupby('Date_GMT8').agg(
+        Day_High=('Gold_High', 'max'),
+        Day_Low=('Gold_Low', 'min'),
+        Day_Open=('Gold_Open', 'first'),
+        Day_Close=('Gold_Close', 'last')
+    )
+    daily_stats['PDH'] = daily_stats['Day_High'].shift(1)
+    daily_stats['PDL'] = daily_stats['Day_Low'].shift(1)
+    daily_stats['PDC'] = daily_stats['Day_Close'].shift(1)
+    daily_stats['Daily_Open'] = daily_stats['Day_Open']
+
+    df = df.join(daily_stats[['PDH', 'PDL', 'PDC', 'Daily_Open']], on='Date_GMT8')
+    df['PDH'] = df['PDH'].ffill()
+    df['PDL'] = df['PDL'].ffill()
+    df['PDC'] = df['PDC'].ffill()
+    df['Daily_Open'] = df['Daily_Open'].ffill()
+
+    # Asian Session POIs (08:00 - 15:59 GMT+8)
+    asian_mask = (df['Hour_GMT8'] >= 8) & (df['Hour_GMT8'] < 16)
+    asian_stats = df[asian_mask].groupby('Date_GMT8').agg(
+        ASH=('Gold_High', 'max'),
+        ASL=('Gold_Low', 'min')
+    )
+    df = df.join(asian_stats, on='Date_GMT8')
+    df['ASH'] = df['ASH'].ffill()
+    df['ASL'] = df['ASL'].ffill()
+
+    # Distances to POIs
+    df['Dist_PDH'] = (df['Gold_Close'] - df['PDH']) / (df['Gold_Close'] + 1e-6)
+    df['Dist_PDL'] = (df['Gold_Close'] - df['PDL']) / (df['Gold_Close'] + 1e-6)
+    df['Dist_Daily_Open'] = (df['Gold_Close'] - df['Daily_Open']) / (df['Gold_Close'] + 1e-6)
+    df['Dist_ASH'] = (df['Gold_Close'] - df['ASH']) / (df['Gold_Close'] + 1e-6)
+    df['Dist_ASL'] = (df['Gold_Close'] - df['ASL']) / (df['Gold_Close'] + 1e-6)
+
+    # 24h Rolling Volume-Weighted Average Price (VWAP)
+    rolling_pv = (df['Gold_Close'] * df['Gold_Volume']).rolling(96).sum()
+    rolling_v  = df['Gold_Volume'].rolling(96).sum()
+    df['Gold_VWAP_24h'] = rolling_pv / (rolling_v + 1e-6)
+    df['Dist_VWAP_24h'] = (df['Gold_Close'] - df['Gold_VWAP_24h']) / (df['Gold_Close'] + 1e-6)
+
+    # 24h ATR & Volatility Squeeze (Range Compression)
+    df['Gold_Range']   = df['Gold_High'] - df['Gold_Low']
+    df['Silver_Range'] = df['Silver_High'] - df['Silver_Low']
+    df['Gold_ATR_24h'] = df['Gold_Range'].rolling(96).mean()
+    df['Range_Compression'] = df['Gold_Range'].rolling(16).mean() / (df['Gold_ATR_24h'] + 1e-6)
+
+    # -------------------------------------------------------------
+    # TIER 3: MICRO DYNAMICS & STATIONARY DIFFERENCING (d=1, 4 Hours)
+    # -------------------------------------------------------------
     df['Gold_Close_diff1'] = df['Gold_Close'].diff(1)
     df['Gold_High_diff1']  = df['Gold_High'].diff(1)
     df['Gold_Low_diff1']   = df['Gold_Low'].diff(1)
@@ -108,15 +205,12 @@ def build_features_and_targets(df_raw, max_lags=16, max_horizon=16):
     df['Silver_Low_diff1']   = df['Silver_Low'].diff(1)
     df['Silver_Open_diff1']  = df['Silver_Open'].diff(1)
 
-    # Volatility / Spreads
-    df['Gold_Range']   = df['Gold_High'] - df['Gold_Low']
-    df['Silver_Range'] = df['Silver_High'] - df['Silver_Low']
     df['Gold_Log_Volume']   = np.log1p(df['Gold_Volume'])
     df['Silver_Log_Volume'] = np.log1p(df['Silver_Volume'])
     df['Gold_Vol_Ratio']   = df['Gold_Volume'] / (df['Gold_Volume'].rolling(20).mean() + 1e-6)
     df['Silver_Vol_Ratio'] = df['Silver_Volume'] / (df['Silver_Volume'].rolling(20).mean() + 1e-6)
 
-    # Momentum
+    # Cross-Asset Momentum & Spillovers
     df['Gold_Silver_Spread_diff'] = df['Gold_Close_diff1'] - df['Silver_Close_diff1']
     df['Gold_Ret_4']  = df['Gold_Close'].pct_change(4)
     df['Gold_Ret_8']  = df['Gold_Close'].pct_change(8)
@@ -125,29 +219,22 @@ def build_features_and_targets(df_raw, max_lags=16, max_horizon=16):
     df['Silver_Ret_8']  = df['Silver_Close'].pct_change(8)
     df['Silver_Ret_16'] = df['Silver_Close'].pct_change(16)
 
-    # 16 Lags
+    # 16 Lags & Forward Targets (Batch Concatenation to avoid fragmentation)
+    extra_cols = {}
     lag_cols = ['Gold_Close_diff1', 'Gold_High_diff1', 'Gold_Low_diff1', 'Gold_Range', 'Gold_Vol_Ratio',
                 'Silver_Close_diff1', 'Silver_High_diff1', 'Silver_Low_diff1', 'Silver_Range', 'Silver_Vol_Ratio']
     for lag in range(1, max_lags + 1):
         for col in lag_cols:
-            df[f'{col}_lag{lag}'] = df[col].shift(lag)
+            extra_cols[f'{col}_lag{lag}'] = df[col].shift(lag)
 
-    # Time Encodings
-    if isinstance(df.index, pd.DatetimeIndex):
-        minute_of_day = df.index.hour * 60 + df.index.minute
-        df['Sin_Time'] = np.sin(2 * np.pi * minute_of_day / 1440)
-        df['Cos_Time'] = np.cos(2 * np.pi * minute_of_day / 1440)
-        df['DayOfWeek'] = df.index.dayofweek
-
-    # Targets: 16 Steps & 4 Envelopes
     target_cols = []
     for step in range(1, max_horizon + 1):
-        df[f'Gold_High_step_{step}']  = df['Gold_High'].shift(-step) - df['Gold_Close']
-        df[f'Gold_Low_step_{step}']   = df['Gold_Low'].shift(-step) - df['Gold_Close']
-        df[f'Gold_Close_step_{step}'] = df['Gold_Close'].shift(-step) - df['Gold_Close']
-        df[f'Silver_High_step_{step}']  = df['Silver_High'].shift(-step) - df['Silver_Close']
-        df[f'Silver_Low_step_{step}']   = df['Silver_Low'].shift(-step) - df['Silver_Close']
-        df[f'Silver_Close_step_{step}'] = df['Silver_Close'].shift(-step) - df['Silver_Close']
+        extra_cols[f'Gold_High_step_{step}']  = df['Gold_High'].shift(-step) - df['Gold_Close']
+        extra_cols[f'Gold_Low_step_{step}']   = df['Gold_Low'].shift(-step) - df['Gold_Close']
+        extra_cols[f'Gold_Close_step_{step}'] = df['Gold_Close'].shift(-step) - df['Gold_Close']
+        extra_cols[f'Silver_High_step_{step}']  = df['Silver_High'].shift(-step) - df['Silver_Close']
+        extra_cols[f'Silver_Low_step_{step}']   = df['Silver_Low'].shift(-step) - df['Silver_Close']
+        extra_cols[f'Silver_Close_step_{step}'] = df['Silver_Close'].shift(-step) - df['Silver_Close']
         target_cols.extend([f'Gold_High_step_{step}', f'Gold_Low_step_{step}', f'Gold_Close_step_{step}',
                             f'Silver_High_step_{step}', f'Silver_Low_step_{step}', f'Silver_Close_step_{step}'])
 
@@ -157,14 +244,20 @@ def build_features_and_targets(df_raw, max_lags=16, max_horizon=16):
         forward_s_high = [df['Silver_High'].shift(-i) for i in range(1, h + 1)]
         forward_s_low  = [df['Silver_Low'].shift(-i) for i in range(1, h + 1)]
 
-        df[f'Gold_MFE_{h}'] = pd.concat(forward_g_high, axis=1).max(axis=1) - df['Gold_Close']
-        df[f'Gold_MAE_{h}'] = pd.concat(forward_g_low, axis=1).min(axis=1) - df['Gold_Close']
-        df[f'Silver_MFE_{h}'] = pd.concat(forward_s_high, axis=1).max(axis=1) - df['Silver_Close']
-        df[f'Silver_MAE_{h}'] = pd.concat(forward_s_low, axis=1).min(axis=1) - df['Silver_Close']
+        extra_cols[f'Gold_MFE_{h}'] = pd.concat(forward_g_high, axis=1).max(axis=1) - df['Gold_Close']
+        extra_cols[f'Gold_MAE_{h}'] = pd.concat(forward_g_low, axis=1).min(axis=1) - df['Gold_Close']
+        extra_cols[f'Silver_MFE_{h}'] = pd.concat(forward_s_high, axis=1).max(axis=1) - df['Silver_Close']
+        extra_cols[f'Silver_MAE_{h}'] = pd.concat(forward_s_low, axis=1).min(axis=1) - df['Silver_Close']
         target_cols.extend([f'Gold_MFE_{h}', f'Gold_MAE_{h}', f'Silver_MFE_{h}', f'Silver_MAE_{h}'])
 
+    df = pd.concat([df, pd.DataFrame(extra_cols, index=df.index)], axis=1)
+
     raw_leaks = ['Gold_Open', 'Gold_High', 'Gold_Low', 'Gold_Close', 'Gold_Volume',
-                 'Silver_Open', 'Silver_High', 'Silver_Low', 'Silver_Close', 'Silver_Volume']
+                 'Silver_Open', 'Silver_High', 'Silver_Low', 'Silver_Close', 'Silver_Volume',
+                 'Date_GMT8', 'PDH', 'PDL', 'PDC', 'Daily_Open', 'ASH', 'ASL',
+                 'Gold_5d_High', 'Gold_5d_Low', 'Silver_5d_High', 'Silver_5d_Low',
+                 'Gold_EMA_50', 'Gold_EMA_200', 'Silver_EMA_50', 'Silver_EMA_200',
+                 'Gold_VWAP_24h']
     feat_names = [c for c in df.columns if c not in target_cols and c not in raw_leaks]
 
     labeled_data = df.dropna(subset=feat_names + target_cols).copy()
@@ -173,10 +266,10 @@ def build_features_and_targets(df_raw, max_lags=16, max_horizon=16):
     return labeled_data, feat_names, live_row, df
 
 # ==========================================
-# 4. TRAINING & INFERENCE PIPELINE
+# 4. TRAINING & ASYMMETRIC POI ENGINE
 # ==========================================
 def run_sniper_engine():
-    print("--> Starting Sniper Engine...")
+    print("--> Starting Multi-Scale POI Sniper Engine...")
     raw_market = get_market_data()
     labeled_data, feat_names, live_row, master_df = build_features_and_targets(raw_market)
 
@@ -187,14 +280,20 @@ def run_sniper_engine():
     y_gold_env = labeled_data[['Gold_MFE_4', 'Gold_MAE_4', 'Gold_MFE_8', 'Gold_MAE_8', 
                                'Gold_MFE_12', 'Gold_MAE_12', 'Gold_MFE_16', 'Gold_MAE_16']]
 
-    print(f"--> Training on {len(labeled_data)} labeled historical candles...")
-    lgbm_p = dict(n_estimators=120, learning_rate=0.04, num_leaves=31, random_state=42, n_jobs=-1, verbose=-1)
-    xgb_p  = dict(n_estimators=100, learning_rate=0.04, max_depth=5, random_state=42, n_jobs=-1)
+    print(f"--> Training on {len(labeled_data)} labeled candles across 1-week macro hierarchy ({len(feat_names)} features)...")
+    lgbm_env_p  = dict(n_estimators=45, learning_rate=0.06, num_leaves=15, max_bin=63, random_state=42, n_jobs=-1, verbose=-1)
+    xgb_env_p   = dict(n_estimators=40, learning_rate=0.06, max_depth=3, tree_method='hist', random_state=42, n_jobs=-1)
+    
+    lgbm_path_p = dict(n_estimators=25, learning_rate=0.08, num_leaves=15, max_bin=63, random_state=42, n_jobs=-1, verbose=-1)
+    xgb_path_p  = dict(n_estimators=20, learning_rate=0.08, max_depth=3, tree_method='hist', random_state=42, n_jobs=-1)
 
-    m_lgbm_path = MultiOutputRegressor(LGBMRegressor(**lgbm_p)).fit(X_train, y_gold_path)
-    m_xgb_path  = MultiOutputRegressor(XGBRegressor(**xgb_p)).fit(X_train, y_gold_path)
-    m_lgbm_env  = MultiOutputRegressor(LGBMRegressor(**lgbm_p)).fit(X_train, y_gold_env)
-    m_xgb_env   = MultiOutputRegressor(XGBRegressor(**xgb_p)).fit(X_train, y_gold_env)
+    print("--> Fitting LightGBM Path & Envelope Engines...")
+    m_lgbm_path = MultiOutputRegressor(LGBMRegressor(**lgbm_path_p)).fit(X_train, y_gold_path)
+    m_lgbm_env  = MultiOutputRegressor(LGBMRegressor(**lgbm_env_p)).fit(X_train, y_gold_env)
+
+    print("--> Fitting XGBoost Path & Envelope Engines...")
+    m_xgb_path  = MultiOutputRegressor(XGBRegressor(**xgb_path_p)).fit(X_train, y_gold_path)
+    m_xgb_env   = MultiOutputRegressor(XGBRegressor(**xgb_env_p)).fit(X_train, y_gold_env)
 
     # Live Predictions
     latest_feat = live_row[feat_names]
@@ -206,78 +305,139 @@ def run_sniper_engine():
         idx_gmt8 = master_df.index.tz_localize('UTC').tz_convert('Asia/Singapore')
     else:
         idx_gmt8 = master_df.index.tz_convert('Asia/Singapore')
-    curr_time_gmt8 = idx_gmt8[-1].strftime('%Y-%m-%d %H:%M [GMT+8]')
+    
+    latest_dt = idx_gmt8[-1]
+    curr_time_gmt8 = latest_dt.strftime('%Y-%m-%d %H:%M [GMT+8]')
+    curr_hour = latest_dt.hour
 
-    # Gold Forecasts
+    # Session Context Tagging (09:00, 17:00, 21:00 GMT+8 targets)
+    if curr_hour == 9:
+        session_title = "ASIAN SESSION (Post-Open Initial Balance Sweep)"
+    elif curr_hour == 17:
+        session_title = "LONDON SESSION (Post-Open Judas Swing Resolution)"
+    elif curr_hour == 21:
+        session_title = "NEW YORK SESSION (Post-Open US Cash Expansion)"
+    else:
+        session_title = f"INTRADAY SESSION ({latest_dt.strftime('%H:%M')} GMT+8)"
+
+    # Live Model Forecasts
     lgbm_path = m_lgbm_path.predict(latest_feat)[0]
     xgb_path  = m_xgb_path.predict(latest_feat)[0]
     lgbm_env  = m_lgbm_env.predict(latest_feat)[0]
     xgb_env   = m_xgb_env.predict(latest_feat)[0]
 
-    # Generate Chart
-    generate_forecast_chart(master_df, idx_gmt8, curr_gold_close, lgbm_path, xgb_path, CHART_FILE)
-
-    # 2h Metrics for Gold (Bar #8)
+    # Model Predicted Expansions
     lgbm_up_2h   = lgbm_env[2]
     lgbm_down_2h = abs(lgbm_env[3])
     xgb_up_2h    = xgb_env[2]
     xgb_down_2h  = abs(xgb_env[3])
 
-    # Calculate both Bullish and Bearish R:R
-    lgbm_bull_rr = lgbm_up_2h / max(lgbm_down_2h, 0.8)
-    xgb_bull_rr  = xgb_up_2h  / max(xgb_down_2h, 0.8)
+    lgbm_up_4h   = lgbm_env[6]
+    lgbm_down_4h = abs(lgbm_env[7])
+    xgb_up_4h    = xgb_env[6]
+    xgb_down_4h  = abs(xgb_env[7])
 
-    lgbm_bear_rr = lgbm_down_2h / max(lgbm_up_2h, 0.8)
-    xgb_bear_rr  = xgb_down_2h  / max(xgb_up_2h, 0.8)
+    # -------------------------------------------------------------
+    # EXTRACT LIVE STRUCTURAL POIs
+    # -------------------------------------------------------------
+    curr_pdh = master_df['PDH'].iloc[-1]
+    curr_pdl = master_df['PDL'].iloc[-1]
+    curr_ash = master_df['ASH'].iloc[-1]
+    curr_asl = master_df['ASL'].iloc[-1]
+    curr_do  = master_df['Daily_Open'].iloc[-1]
+    curr_5d_high = master_df['Gold_5d_High'].iloc[-1]
+    curr_5d_low  = master_df['Gold_5d_Low'].iloc[-1]
+    curr_week_pct = master_df['Gold_Weekly_Range_Pct'].iloc[-1] * 100
+    curr_ema_slope = master_df['Gold_EMA_Slope'].iloc[-1]
 
-    # Bi-Directional Dual-Key Consensus (Accounting for Cross-Asset Causality)
-    if (lgbm_bear_rr >= 2.0) and (xgb_bear_rr >= 2.0) and (lgbm_down_2h > lgbm_up_2h) and (xgb_down_2h > xgb_up_2h):
+    swing_low_8  = master_df['Gold_Low'].iloc[-8:].min()
+    swing_high_8 = master_df['Gold_High'].iloc[-8:].max()
+
+    # Direction Bias Evaluation
+    bull_score = (lgbm_up_2h > lgbm_down_2h) + (xgb_up_2h > xgb_down_2h) + (curr_ema_slope > 0)
+    bear_score = (lgbm_down_2h > lgbm_up_2h) + (xgb_down_2h > xgb_up_2h) + (curr_ema_slope < 0)
+
+    # -------------------------------------------------------------
+    # ASYMMETRIC POI-ANCHORED RISK & TARGET DEFINITION
+    # -------------------------------------------------------------
+    entry_price = curr_gold_close
+
+    if (lgbm_down_2h > lgbm_up_2h) and (xgb_down_2h > xgb_up_2h):
         direction = "BEARISH (SELL / SHORT)"
-        trigger_ref = "SILVER Breakdown -> Leads Gold Low (F=11.28)"
+        trigger_ref = "SILVER Breakdown -> Leads Gold Low (F=11.28, p<0.0008)"
         action = "SELL / SHORT GOLD"
         instrument = "GOLD (GC=F)"
-        primary_lgbm_rr = f"{lgbm_bear_rr:.1f}:1"
-        primary_xgb_rr  = f"{xgb_bear_rr:.1f}:1"
-        verdict = "STRICT AGREEMENT (Both Models Trigger SHORT)"
-        hard_sl = curr_gold_close + max(lgbm_up_2h, xgb_up_2h) + 0.50
-        tp1 = curr_gold_close - abs((lgbm_env[1] + xgb_env[1]) / 2.0)
-        tp2 = curr_gold_close - min(lgbm_down_2h, xgb_down_2h)
-        risk_dist = hard_sl - curr_gold_close
+        
+        # Invalidation ceiling: Above local 8-bar high or Asian High
+        structural_ceiling = max(swing_high_8, curr_ash if entry_price < curr_ash else swing_high_8)
+        raw_risk = (structural_ceiling + 0.50) - entry_price
+        risk_dist = float(np.clip(raw_risk, 2.50, 5.50))
+        hard_sl = entry_price + risk_dist
+        
+        # Asymmetric Take Profits
+        # TP1: 1h partial target (>= 2.2:1 R:R)
+        tp1 = entry_price - max(risk_dist * 2.2, (abs(lgbm_env[1]) + abs(xgb_env[1])) / 2.0)
+        
+        # TP2: 2h-4h macro target (>= 3.8:1 to 5.0+:1 R:R), targeting PDL/5d Low if nearby
+        base_tp2_dist = max(risk_dist * 3.8, min(lgbm_down_4h, xgb_down_4h))
+        tp2 = entry_price - base_tp2_dist
+        if curr_pdl < entry_price - (risk_dist * 2.5):
+            tp2 = min(tp2, curr_pdl)
+        
+        rr_tp1 = abs(entry_price - tp1) / risk_dist
+        rr_tp2 = abs(entry_price - tp2) / risk_dist
+        verdict = f"STRICT AGREEMENT (Both Models Trigger SHORT | {rr_tp2:.1f}:1 R:R)"
+        poi_invalidation_str = f"Above 8-Bar Pivot / ASH (${structural_ceiling:.2f} + $0.50)"
 
-    elif (lgbm_bull_rr >= 2.0) and (xgb_bull_rr >= 2.0) and (lgbm_up_2h > lgbm_down_2h) and (xgb_up_2h > xgb_down_2h):
+    elif (lgbm_up_2h > lgbm_down_2h) and (xgb_up_2h > xgb_down_2h):
         direction = "BULLISH (BUY / LONG)"
         trigger_ref = "GOLD Breakout -> Leads Silver High (F=4.12, High Beta)"
         action = "BUY / LONG SILVER (or Gold)"
         instrument = "SILVER (SI=F) / GOLD (GC=F)"
-        primary_lgbm_rr = f"{lgbm_bull_rr:.1f}:1"
-        primary_xgb_rr  = f"{xgb_bull_rr:.1f}:1"
-        verdict = "STRICT AGREEMENT (Both Models Trigger LONG)"
-        hard_sl = curr_gold_close - max(lgbm_down_2h, xgb_down_2h) - 0.50
-        tp1 = curr_gold_close + abs((lgbm_env[0] + xgb_env[0]) / 2.0)
-        tp2 = curr_gold_close + min(lgbm_up_2h, xgb_up_2h)
-        risk_dist = curr_gold_close - hard_sl
+        
+        # Invalidation floor: Below local 8-bar low or Asian Low
+        structural_floor = min(swing_low_8, curr_asl if entry_price > curr_asl else swing_low_8)
+        raw_risk = entry_price - (structural_floor - 0.50)
+        risk_dist = float(np.clip(raw_risk, 2.50, 5.50))
+        hard_sl = entry_price - risk_dist
+        
+        # Asymmetric Take Profits
+        # TP1: 1h partial target (>= 2.2:1 R:R)
+        tp1 = entry_price + max(risk_dist * 2.2, (lgbm_env[0] + xgb_env[0]) / 2.0)
+        
+        # TP2: 2h-4h macro target (>= 3.8:1 to 5.0+:1 R:R), targeting PDH/5d High if nearby
+        base_tp2_dist = max(risk_dist * 3.8, min(lgbm_up_4h, xgb_up_4h))
+        tp2 = entry_price + base_tp2_dist
+        if curr_pdh > entry_price + (risk_dist * 2.5):
+            tp2 = max(tp2, curr_pdh)
+            
+        rr_tp1 = abs(tp1 - entry_price) / risk_dist
+        rr_tp2 = abs(tp2 - entry_price) / risk_dist
+        verdict = f"STRICT AGREEMENT (Both Models Trigger LONG | {rr_tp2:.1f}:1 R:R)"
+        poi_invalidation_str = f"Below 8-Bar Pivot / ASL (${structural_floor:.2f} - $0.50)"
 
     else:
         direction = "NEUTRAL / CHOP"
-        trigger_ref = "Cross-Asset Range Compression"
-        action = "STAND DOWN (Wait for Confluence)"
+        trigger_ref = "Cross-Asset Range Compression / Model Divergence"
+        action = "STAND DOWN (Wait for Session POI Sweep)"
         instrument = "NONE (Capital Protected)"
-        primary_lgbm_rr = f"Bull {lgbm_bull_rr:.1f}:1 | Bear {lgbm_bear_rr:.1f}:1"
-        primary_xgb_rr  = f"Bull {xgb_bull_rr:.1f}:1 | Bear {xgb_bear_rr:.1f}:1"
-        verdict = "DIVERGENCE / CONGESTION (No Trade)"
-        hard_sl = curr_gold_close
-        tp1 = curr_gold_close
-        tp2 = curr_gold_close
         risk_dist = 0.0
+        hard_sl = entry_price
+        tp1 = entry_price
+        tp2 = entry_price
+        rr_tp1 = 0.0
+        rr_tp2 = 0.0
+        verdict = "DIVERGENCE / RANGE CHOP (No Clean Asymmetric Setup)"
+        poi_invalidation_str = "N/A (Chop Regime)"
 
     # Compute 8 Extreme Points (4-Hour Window)
-    l_h = [curr_gold_close + lgbm_path[i] for i in range(16)]
-    l_l = [curr_gold_close + lgbm_path[16 + i] for i in range(16)]
-    l_c = [curr_gold_close + lgbm_path[32 + i] for i in range(16)]
+    l_h = [entry_price + lgbm_path[i] for i in range(16)]
+    l_l = [entry_price + lgbm_path[16 + i] for i in range(16)]
+    l_c = [entry_price + lgbm_path[32 + i] for i in range(16)]
 
-    x_h = [curr_gold_close + xgb_path[i] for i in range(16)]
-    x_l = [curr_gold_close + xgb_path[16 + i] for i in range(16)]
-    x_c = [curr_gold_close + xgb_path[32 + i] for i in range(16)]
+    x_h = [entry_price + xgb_path[i] for i in range(16)]
+    x_l = [entry_price + xgb_path[16 + i] for i in range(16)]
+    x_c = [entry_price + xgb_path[32 + i] for i in range(16)]
 
     l_max_h = (int(np.argmax(l_h)) + 1) * 15, max(l_h)
     l_min_l = (int(np.argmin(l_l)) + 1) * 15, min(l_l)
@@ -289,47 +449,62 @@ def run_sniper_engine():
     x_max_c = (int(np.argmax(x_c)) + 1) * 15, max(x_c)
     x_min_c = (int(np.argmin(x_c)) + 1) * 15, min(x_c)
 
-    # Build Telegram Message
+    # -------------------------------------------------------------
+    # GENERATE POI-ENRICHED FORECAST CHART
+    # -------------------------------------------------------------
+    poi_dict = {
+        'PDH': curr_pdh, 'PDL': curr_pdl,
+        'ASH': curr_ash, 'ASL': curr_asl,
+        'Entry': entry_price, 'SL': hard_sl, 'TP1': tp1, 'TP2': tp2,
+        'Action': action, 'Direction': direction, 'Risk': risk_dist,
+        'RR_TP1': rr_tp1, 'RR_TP2': rr_tp2
+    }
+    generate_forecast_chart(master_df, idx_gmt8, entry_price, lgbm_path, xgb_path, poi_dict, CHART_FILE)
+
+    # -------------------------------------------------------------
+    # BUILD TELEGRAM REPORT
+    # -------------------------------------------------------------
+    trend_regime_str = "BULLISH (EMA50 > EMA200)" if curr_ema_slope > 0 else "BEARISH (EMA50 < EMA200)"
+    
     message = (
-        f"🎯 <b>[DUAL-KEY SNIPER SESSION REPORT]</b>\n"
-        f"⏰ <b>Session Time:</b> {curr_time_gmt8}\n\n"
-        f"📌 <b>Suggested Asset:</b> <code>{instrument}</code>\n"
+        f"🎯 <b>[MULTI-SCALE POI SNIPER REPORT]</b>\n"
+        f"🏛️ <b>Session:</b> <code>{session_title}</code>\n"
+        f"⏰ <b>Time:</b> {curr_time_gmt8}\n\n"
+        f"📌 <b>Trading Asset:</b> <code>{instrument}</code>\n"
         f"🔗 <b>Causality Driver:</b> {trigger_ref}\n"
-        f"💵 <b>Current Gold Price:</b> <code>${curr_gold_close:.2f}</code>\n"
-        f"💵 <b>Current Silver Price:</b> <code>${curr_silver_close:.3f}</code>\n\n"
-        f"📊 <b>2-Hour Forecast (Bar #8):</b>\n"
+        f"🧭 <b>1-Week Macro Regime:</b> <code>{trend_regime_str}</code> (Range: {curr_week_pct:.1f}%)\n"
+        f"💵 <b>Current Gold Close:</b> <code>${entry_price:.2f}</code>\n"
+        f"💵 <b>Current Silver Close:</b> <code>${curr_silver_close:.3f}</code>\n\n"
+        f"📍 <b>Key Market Structure POIs:</b>\n"
+        f"• <b>PDH / PDL:</b> <code>${curr_pdh:.2f}</code> / <code>${curr_pdl:.2f}</code>\n"
+        f"• <b>Asian Range (ASH/ASL):</b> <code>${curr_ash:.2f}</code> / <code>${curr_asl:.2f}</code>\n"
+        f"• <b>5-Day High / Low:</b> <code>${curr_5d_high:.2f}</code> / <code>${curr_5d_low:.2f}</code>\n\n"
+        f"📊 <b>Model Consensus & Asymmetric Setup:</b>\n"
         f"• <b>Direction Bias:</b> <b>{direction}</b>\n"
-        f"• <b>LightGBM:</b> Upside +${lgbm_up_2h:.2f} | Down -${lgbm_down_2h:.2f} (R:R: <b>{primary_lgbm_rr}</b>)\n"
-        f"• <b>XGBoost:</b>  Upside +${xgb_up_2h:.2f} | Down -${xgb_down_2h:.2f} (R:R: <b>{primary_xgb_rr}</b>)\n"
-        f"🚦 <b>Consensus:</b> <b>{verdict}</b>\n"
+        f"• <b>LightGBM 2h Target:</b> Upside +${lgbm_up_2h:.2f} | Down -${lgbm_down_2h:.2f}\n"
+        f"• <b>XGBoost  2h Target:</b> Upside +${xgb_up_2h:.2f} | Down -${xgb_down_2h:.2f}\n"
+        f"🚦 <b>Verdict:</b> <b>{verdict}</b>\n"
         f"──────────────────────────────\n"
         f"🛒 <b>Action:</b> <b>{action}</b>\n"
-        f"🔴 <b>Hard Stop Loss:</b> <code>${hard_sl:.2f}</code> (Risk: ${risk_dist:.2f})\n"
-        f"🟢 <b>Take Profit 1 (1h):</b> <code>${tp1:.2f}</code>\n"
-        f"🟢 <b>Take Profit 2 (2h):</b> <code>${tp2:.2f}</code>\n"
-        f"⏱️ <b>Time-Stop:</b> Bar #8 (+120 min)\n"
+        f"🔴 <b>Structural Stop Loss:</b> <code>${hard_sl:.2f}</code> (Risk: <b>${risk_dist:.2f}</b>)\n"
+        f"   └ <i>Invalidation: {poi_invalidation_str}</i>\n"
+        f"🟢 <b>Take Profit 1 (1h):</b> <code>${tp1:.2f}</code> (<b>{rr_tp1:.1f}:1 R:R</b>)\n"
+        f"🟢 <b>Take Profit 2 (2h-4h POI):</b> <code>${tp2:.2f}</code> (<b>{rr_tp2:.1f}:1 R:R</b>)\n"
+        f"⏱️ <b>Time-Stop:</b> Bar #8 (+120 min) - Scratch if no expansion\n"
         f"──────────────────────────────\n"
         f"📍 <b>8 Forecast Extremes (Next 4 Hours):</b>\n"
-        f"🔵 <b>LightGBM:</b>\n"
-        f"  • Max High: <code>${l_max_h[1]:.2f}</code> (+{l_max_h[0]}m)\n"
-        f"  • Min Low: <code>${l_min_l[1]:.2f}</code> (+{l_min_l[0]}m)\n"
-        f"  • Peak Close: <code>${l_max_c[1]:.2f}</code> (+{l_max_c[0]}m)\n"
-        f"  • Floor Close: <code>${l_min_c[1]:.2f}</code> (+{l_min_c[0]}m)\n"
-        f"🟠 <b>XGBoost:</b>\n"
-        f"  • Max High: <code>${x_max_h[1]:.2f}</code> (+{x_max_h[0]}m)\n"
-        f"  • Min Low: <code>${x_min_l[1]:.2f}</code> (+{x_min_l[0]}m)\n"
-        f"  • Peak Close: <code>${x_max_c[1]:.2f}</code> (+{x_max_c[0]}m)\n"
-        f"  • Floor Close: <code>${x_min_c[1]:.2f}</code> (+{x_min_c[0]}m)\n"
+        f"🔵 <b>LightGBM:</b> High <code>${l_max_h[1]:.2f}</code> (+{l_max_h[0]}m) | Low <code>${l_min_l[1]:.2f}</code> (+{l_min_l[0]}m)\n"
+        f"🟠 <b>XGBoost:</b>  High <code>${x_max_h[1]:.2f}</code> (+{x_max_h[0]}m) | Low <code>${x_min_l[1]:.2f}</code> (+{x_min_l[0]}m)\n"
         f"──────────────────────────────\n"
-        f"<i>Check the attached chart for full 16-candle trajectory and envelopes.</i>"
+        f"<i>Inspect the attached chart for POI levels, entry, SL, and 16-candle projection.</i>"
     )
 
     send_telegram_notification(message, CHART_FILE)
 
 # ==========================================
-# 5. CHART GENERATOR
+# 5. POI-ENRICHED CHART GENERATOR
 # ==========================================
-def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path, save_path):
+def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path, poi_dict, save_path):
     hist_len = 16
     hist_df = master_df.tail(hist_len).copy()
     future_indices = list(range(hist_len, hist_len + 16))
@@ -346,10 +521,10 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
     y_lgbm_c = [curr_close] + lgbm_close
     y_xgb_c  = [curr_close] + xgb_close
 
-    fig, ax = plt.subplots(figsize=(22, 10), facecolor='#121212')
-    ax.set_facecolor('#1a1a1a')
+    fig, ax = plt.subplots(figsize=(24, 11), facecolor='#121212')
+    ax.set_facecolor('#181818')
 
-    # Historical
+    # Historical Candlesticks
     bar_width = 0.65
     for i in range(hist_len):
         row = hist_df.iloc[i]
@@ -360,23 +535,65 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
                                  facecolor=c, edgecolor=c, alpha=0.9)
         ax.add_patch(rect)
 
-    # NOW Line
+    # NOW Vertical Line
     ax.axvline(x=hist_len - 1, color='#ffffff', linestyle=':', linewidth=2.5, alpha=0.95)
-    ax.text(hist_len - 0.85, curr_close + 10, ' NOW', color='#ffffff', fontsize=13, fontweight='bold')
+    ax.text(hist_len - 0.85, curr_close + 8, ' NOW', color='#ffffff', fontsize=13, fontweight='bold')
 
-    # Models
-    ax.plot(x_conn, y_lgbm_c, color='#00e5ff', linewidth=3.0, marker='o', markersize=6, label='LightGBM Close')
-    ax.fill_between(future_indices, lgbm_low, lgbm_high, color='#00e5ff', alpha=0.14, label='LightGBM Envelope')
+    # Models Projections
+    ax.plot(x_conn, y_lgbm_c, color='#00e5ff', linewidth=3.0, marker='o', markersize=6, label='LightGBM Projected Path')
+    ax.fill_between(future_indices, lgbm_low, lgbm_high, color='#00e5ff', alpha=0.12, label='LightGBM Envelope')
 
-    ax.plot(x_conn, y_xgb_c, color='#ffab00', linewidth=3.0, marker='s', markersize=6, label='XGBoost Close')
-    ax.fill_between(future_indices, xgb_low, xgb_high, color='#ffab00', alpha=0.14, label='XGBoost Envelope')
+    ax.plot(x_conn, y_xgb_c, color='#ffab00', linewidth=3.0, marker='s', markersize=6, label='XGBoost Projected Path')
+    ax.fill_between(future_indices, xgb_low, xgb_high, color='#ffab00', alpha=0.12, label='XGBoost Envelope')
 
-    # Time-Stop
-    ax.axvline(x=hist_len + 7, color='#ff5252', linestyle='--', linewidth=2.0, alpha=0.85)
-    ax.text(hist_len + 7.25, curr_close - 4.5, '2h Time-Stop (+120m)', color='#ff5252', fontsize=12, fontweight='bold', rotation=90)
-    ax.axhline(y=curr_close, color='#bdbdbd', linestyle='-.', linewidth=1.4, alpha=0.7, label=f'Current (${curr_close:.2f})')
+    # 2h Time-Stop Line
+    ax.axvline(x=hist_len + 7, color='#ff5252', linestyle='--', linewidth=2.0, alpha=0.8)
+    ax.text(hist_len + 7.25, curr_close - 5.0, '2h Time-Stop (+120m)', color='#ff5252', fontsize=12, fontweight='bold', rotation=90)
 
-    # Annotate Extremes (8 points)
+    # -------------------------------------------------------------
+    # STRUCTURAL POIs & EXECUTION TARGET OVERLAYS
+    # -------------------------------------------------------------
+    total_bars = hist_len + 16
+    
+    # PDH & PDL (Previous Day Extremes)
+    if not np.isnan(poi_dict['PDH']):
+        ax.axhline(y=poi_dict['PDH'], color='#ffd54f', linestyle='--', linewidth=1.4, alpha=0.75)
+        ax.text(0.5, poi_dict['PDH'] + 0.6, f"PDH: ${poi_dict['PDH']:.2f}", color='#ffd54f', fontsize=11, fontweight='bold')
+    
+    if not np.isnan(poi_dict['PDL']):
+        ax.axhline(y=poi_dict['PDL'], color='#ffd54f', linestyle='--', linewidth=1.4, alpha=0.75)
+        ax.text(0.5, poi_dict['PDL'] - 1.2, f"PDL: ${poi_dict['PDL']:.2f}", color='#ffd54f', fontsize=11, fontweight='bold')
+
+    # Asian Range (ASH / ASL)
+    if not np.isnan(poi_dict['ASH']):
+        ax.axhline(y=poi_dict['ASH'], color='#80deea', linestyle=':', linewidth=1.2, alpha=0.65)
+        ax.text(hist_len * 0.45, poi_dict['ASH'] + 0.6, f"ASH: ${poi_dict['ASH']:.2f}", color='#80deea', fontsize=10.5)
+
+    if not np.isnan(poi_dict['ASL']):
+        ax.axhline(y=poi_dict['ASL'], color='#80deea', linestyle=':', linewidth=1.2, alpha=0.65)
+        ax.text(hist_len * 0.45, poi_dict['ASL'] - 1.2, f"ASL: ${poi_dict['ASL']:.2f}", color='#80deea', fontsize=10.5)
+
+    # Execution Setup Levels (If Active)
+    if poi_dict['Risk'] > 0:
+        # Stop Loss
+        ax.axhline(y=poi_dict['SL'], color='#ff1744', linestyle='-', linewidth=2.2, alpha=0.95)
+        ax.text(total_bars - 4.5, poi_dict['SL'] + 0.6, f"HARD SL: ${poi_dict['SL']:.2f} (Risk: ${poi_dict['Risk']:.2f})", 
+                color='#ff1744', fontsize=11.5, fontweight='bold', bbox=dict(boxstyle="round,pad=0.2", fc="#2a0000", ec="#ff1744", lw=1.2))
+
+        # Take Profit 1
+        ax.axhline(y=poi_dict['TP1'], color='#69f0ae', linestyle='-.', linewidth=2.0, alpha=0.9)
+        ax.text(total_bars - 4.5, poi_dict['TP1'] + 0.6, f"TP1 (1h): ${poi_dict['TP1']:.2f} ({poi_dict['RR_TP1']:.1f}:1 R:R)", 
+                color='#69f0ae', fontsize=11, fontweight='bold', bbox=dict(boxstyle="round,pad=0.2", fc="#002a11", ec="#69f0ae", lw=1.2))
+
+        # Take Profit 2
+        ax.axhline(y=poi_dict['TP2'], color='#00e676', linestyle='-', linewidth=2.4, alpha=0.95)
+        ax.text(total_bars - 4.5, poi_dict['TP2'] + 0.6, f"TP2 (POI): ${poi_dict['TP2']:.2f} ({poi_dict['RR_TP2']:.1f}:1 R:R)", 
+                color='#00e676', fontsize=12, fontweight='bold', bbox=dict(boxstyle="round,pad=0.25", fc="#003314", ec="#00e676", lw=1.5))
+
+    # Current Price Line
+    ax.axhline(y=curr_close, color='#ffffff', linestyle='-.', linewidth=1.4, alpha=0.8, label=f'Entry (${curr_close:.2f})')
+
+    # Annotate Forecast Extremes
     def callout(x, y, text, fc, ec, offset):
         ax.scatter(x, y, color=ec, s=75, zorder=6, edgecolor='#ffffff', linewidth=1.2)
         ax.annotate(text, xy=(x, y), xytext=(x + offset[0], y + offset[1]),
@@ -384,15 +601,12 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
                     arrowprops=dict(arrowstyle="->", color=ec, lw=1.4),
                     color="#ffffff", fontsize=9.5, fontweight="bold", ha='center')
 
-    # LGBM Extremes
     callout(future_indices[np.argmax(lgbm_high)], max(lgbm_high), f"LGBM Max: ${max(lgbm_high):.2f}", "#002b33", "#00e5ff", (-1.5, 3.5))
     callout(future_indices[np.argmin(lgbm_low)],  min(lgbm_low),  f"LGBM Min: ${min(lgbm_low):.2f}",  "#002b33", "#00e5ff", (-1.5, -4.0))
-    # XGB Extremes
     callout(future_indices[np.argmax(xgb_high)],  max(xgb_high),  f"XGB Max: ${max(xgb_high):.2f}",  "#332200", "#ffab00", (1.5, 3.5))
     callout(future_indices[np.argmin(xgb_low)],   min(xgb_low),   f"XGB Min: ${min(xgb_low):.2f}",   "#332200", "#ffab00", (1.5, -4.0))
 
-    # Ticks
-    total_bars = hist_len + 16
+    # Ticks & Formatting
     ax.set_xlim(-0.8, total_bars + 0.5)
     hist_ticks = [0, 4, 8, 12, 15]
     hist_gmt8_tail = idx_gmt8[-hist_len:]
@@ -408,13 +622,13 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
         if tick >= hist_len:
             label.set_color('#80d8ff')
 
-    ax.set_title("Dual-Key Sniper Forecast: 16 Past Candles vs. 16 Projected Future Candles (+15m to +240m)", 
+    ax.set_title(f"Multi-Scale POI Sniper Forecast: 16 Past Candles vs. 16 Projected Future Candles (+15m to +240m)", 
                  color='#ffffff', fontsize=18, fontweight='bold', pad=20)
     ax.set_ylabel("Gold Price ($)", color='#ffffff', fontsize=15, fontweight='bold', labelpad=14)
     ax.set_xlabel("Timeline (Historical HH:MM [GMT+8] on Left | +Minutes Projected on Right)", 
                   color='#b0bec5', fontsize=14, fontweight='bold', labelpad=14)
-    ax.grid(True, color='#2c2c2c', linestyle='--', linewidth=0.8, alpha=0.75)
-    ax.legend(facecolor='#212121', edgecolor='#424242', labelcolor='#e0e0e0', loc='upper left', fontsize=12)
+    ax.grid(True, color='#282828', linestyle='--', linewidth=0.8, alpha=0.75)
+    ax.legend(facecolor='#212121', edgecolor='#424242', labelcolor='#e0e0e0', loc='upper left', fontsize=11.5)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=130, facecolor='#121212')
@@ -427,11 +641,13 @@ def generate_forecast_chart(master_df, idx_gmt8, curr_close, lgbm_path, xgb_path
 def send_telegram_notification(text, image_path):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("\n[WARNING] Telegram credentials not set. Printing report locally:")
-        print(text)
+        try:
+            print(text)
+        except Exception:
+            print(text.encode('ascii', errors='ignore').decode('ascii'))
         return
 
     print("--> Sending Telegram notification...")
-    # Send Text
     text_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     res_text = requests.post(text_url, json=payload, timeout=15)
@@ -441,7 +657,6 @@ def send_telegram_notification(text, image_path):
     else:
         print(f"[ERROR] Failed to send text: {res_text.text}")
 
-    # Send Photo
     if image_path.exists():
         photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         with open(image_path, "rb") as f:
